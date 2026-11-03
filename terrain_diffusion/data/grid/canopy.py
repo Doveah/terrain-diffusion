@@ -275,7 +275,8 @@ def aggregate_parent(index: int, out_dir: Path) -> Optional[Path]:
     for b in range(3):
         data[b][covered] = (sums[b][covered] / wsum[covered]).astype(np.float32)
     data[3] = (wsum / (s * s)).astype(np.float32)
-    return _write(parent, data, out_dir, dict(n_sources=0, children=len(kids)))
+    n_src = sum(1 for b in _SOURCES.values() if intersects(b, parent.bounds))
+    return _write(parent, data, out_dir, dict(n_sources=n_src, children=len(kids)))
 
 
 def process_parent(args: Tuple[int, str, int]) -> Tuple[int, float, int]:
