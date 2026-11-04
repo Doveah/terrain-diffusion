@@ -48,6 +48,8 @@ print("parent", best, parent_cells()[best])
 
 cmd = [sys.executable, "-m", "terrain_diffusion.data.grid.canopy", "--chm-dir", str(chm), "--out", str(out),
        "--workers", "1", "--parents", str(best)]
+if len(sys.argv) > 2:  # optional: python canopy_selftest.py <tmpdir> <decimate>
+    cmd += ["--decimate", sys.argv[2]]
 subprocess.run(cmd, check=True)
 
 # ---- checks

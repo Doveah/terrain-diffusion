@@ -14,9 +14,12 @@ Height and cover are NaN where ``valid`` is 0. The 30 m parent product (``<out>/
 3 x 3 block mean of the nine children, weighted by ``valid``.
 
 How it works: each child is processed in blocks. For every block the intersecting source tiles are read with a halo
-(boundless, so area outside a tile's footprint is explicitly invalid), and GDAL's average resampling reprojects height,
-the two indicator rasters and a validity raster onto the block. Several sources meeting inside one block are combined by
-validity-weighted average, so tile seams are exact. No source mosaic or VRT is needed.
+(boundless, so area outside a tile's footprint is explicitly invalid). Height, the two indicators and validity are
+carried as densities (each multiplied by validity), block-meaned from 1 m to ``DECIMATE`` m in the source projection,
+and reprojected onto the block with GDAL's average resampling; dividing by the reprojected validity gives the exact
+validity-weighted means. Sources meeting inside one block add their densities, so tile seams are exact. The decimation
+cuts the reproject work by DECIMATE^2 (16x at the default) and only quantises where a 10 m pixel edge falls in the source
+to 4 m, below the source's own positional accuracy. ``--decimate 1`` gives the undecimated reference.
 
 Run (inside the data-prep container):
 
@@ -39,6 +42,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import rasterio
+from affine import Affine
 from rasterio.enums import Resampling
 from rasterio.warp import reproject, transform_bounds
 from rasterio.windows import Window
@@ -59,11 +63,11 @@ from terrain_diffusion.data.grid.tiles import (  # noqa: E402
     parents_intersecting,
 )
 
-VERSION = "canopy-reducer-1"
+VERSION = "canopy-reducer-2"  # 2: densities decimated before the reproject (exact up to 4 m edge quantisation)
 BANDS = ("height", "cover2", "cover5", "valid")
 THRESHOLDS = (2.0, 5.0)
-SENTINEL = -9999.0
 HALO_PX = 4
+DECIMATE = 4  # block-mean the ~1 m source to this many source pixels per cell before the reproject (1 = off)
 
 
 # --------------------------------------------------------------------------------------------- source index
@@ -107,11 +111,13 @@ def index_sources(chm_dir: Path) -> Dict[str, Bounds]:
 _SOURCES: Dict[str, Bounds] = {}
 _OPEN: Dict[str, rasterio.DatasetReader] = {}
 _MAX_OPEN = 16
+_DECIMATE = DECIMATE
 
 
-def _init_worker(sources: Dict[str, Bounds]) -> None:
-    global _SOURCES
+def _init_worker(sources: Dict[str, Bounds], decimate: int = DECIMATE) -> None:
+    global _SOURCES, _DECIMATE
     _SOURCES = sources
+    _DECIMATE = decimate
     os.environ.setdefault("GDAL_CACHEMAX", "512")
     os.environ.setdefault("GDAL_NUM_THREADS", "1")
 
@@ -128,69 +134,96 @@ def _open(path: str) -> rasterio.DatasetReader:
 
 # --------------------------------------------------------------------------------------------- reduction
 
-def _read_source_block(ds: rasterio.DatasetReader, bounds: Bounds) -> Tuple[np.ndarray, np.ndarray, object]:
-    """Read the part of ``ds`` covering lon/lat ``bounds`` plus a halo. Returns (height, valid_mask, transform)."""
+def _read_source_block(ds: rasterio.DatasetReader, bounds: Bounds, d: int) -> Tuple[np.ndarray, np.ndarray, object]:
+    """Read the part of ``ds`` covering lon/lat ``bounds`` plus a halo, with a window whose size is a multiple of ``d``.
+    Returns (height, valid_mask, transform)."""
     left, bottom, right, top = transform_bounds(CRS, ds.crs, *bounds, densify_pts=21)
     win = rasterio.windows.from_bounds(left, bottom, right, top, ds.transform)
     col0 = math.floor(win.col_off) - HALO_PX
     row0 = math.floor(win.row_off) - HALO_PX
     col1 = math.ceil(win.col_off + win.width) + HALO_PX
     row1 = math.ceil(win.row_off + win.height) + HALO_PX
+    col1 = col0 + -(-(col1 - col0) // d) * d
+    row1 = row0 + -(-(row1 - row0) // d) * d
     w = Window(col0, row0, col1 - col0, row1 - row0)
-    arr = ds.read(1, window=w, boundless=True, masked=True, fill_value=ds.nodata)
-    valid = ~np.ma.getmaskarray(arr)
-    data = np.asarray(arr.filled(0), dtype=np.float32)
-    valid &= np.isfinite(data)
-    # Explicit footprint: anything outside the file's own extent is invalid even when the file declares no nodata,
-    # otherwise the boundless fill (0 = ground) would count as valid canopy at tile seams.
-    rows = np.arange(row0, row1)[:, None]
-    cols = np.arange(col0, col1)[None, :]
-    valid &= (rows >= 0) & (rows < ds.height) & (cols >= 0) & (cols < ds.width)
+    # Read only the part inside the file and place it in a zero/invalid canvas: several times faster than a boundless
+    # masked read, and the file extent is the footprint, so area outside it is explicitly invalid even when the file
+    # declares no nodata (the canvas's 0 = ground must never count as valid canopy at tile seams).
+    data = np.zeros((row1 - row0, col1 - col0), dtype=np.float32)
+    valid = np.zeros(data.shape, dtype=bool)
+    ic0, ir0 = max(col0, 0), max(row0, 0)
+    ic1, ir1 = min(col1, ds.width), min(row1, ds.height)
+    if ic1 > ic0 and ir1 > ir0:
+        a = ds.read(1, window=Window(ic0, ir0, ic1 - ic0, ir1 - ir0))
+        v = np.isfinite(a) if np.issubdtype(a.dtype, np.floating) else np.ones(a.shape, dtype=bool)
+        if ds.nodata is not None:
+            v &= a != ds.nodata
+        sl = (slice(ir0 - row0, ir1 - row0), slice(ic0 - col0, ic1 - col0))
+        data[sl] = np.where(v, a, 0)
+        valid[sl] = v
     return data, valid, window_transform(w, ds.transform)
 
 
-def _average_onto(src: np.ndarray, src_transform, src_crs, dst_shape, dst_transform,
-                  nodata: Optional[float]) -> np.ndarray:
-    dst = np.full(dst_shape, SENTINEL if nodata is not None else 0.0, dtype=np.float32)
+def _decimate(a: np.ndarray, d: int) -> np.ndarray:
+    """Mean over d x d cells; ``a`` has dimensions that are multiples of ``d``."""
+    if d == 1:
+        return a.astype(np.float32, copy=False)
+    # Strided slice adds, accumulated in place: about five times faster than reshape().mean(axis=(1, 3)) and it
+    # takes bool input (the indicator and validity layers) without a full-size float conversion.
+    r = a[0::d].astype(np.float32)
+    for i in range(1, d):
+        r += a[i::d]
+    c = r[:, 0::d].copy()
+    for i in range(1, d):
+        c += r[:, i::d]
+    c *= np.float32(1.0 / (d * d))
+    return c
+
+
+def _average_onto(src: np.ndarray, src_transform, src_crs, dst_shape, dst_transform) -> np.ndarray:
+    """Area-weighted mean of ``src`` on the destination grid; 0 where the source does not reach."""
+    dst = np.zeros(dst_shape, dtype=np.float32)
     reproject(
-        source=src,
+        source=np.ascontiguousarray(src, dtype=np.float32),
         destination=dst,
         src_transform=src_transform,
         src_crs=src_crs,
-        src_nodata=nodata,
+        src_nodata=None,
         dst_transform=dst_transform,
         dst_crs=CRS,
-        dst_nodata=SENTINEL if nodata is not None else 0.0,
+        dst_nodata=0.0,
         resampling=Resampling.average,
         num_threads=1,
     )
     return dst
 
 
-def reduce_block(bounds: Bounds, shape: Tuple[int, int], dst_transform, sources: Sequence[str]) -> np.ndarray:
-    """Four-band float32 block (height, cover2, cover5, valid) for one destination block."""
-    acc = np.zeros((len(BANDS), *shape), dtype=np.float64)  # weighted sums; last band is the weight sum
+def reduce_block(bounds: Bounds, shape: Tuple[int, int], dst_transform, sources: Sequence[str],
+                 decimate: int = DECIMATE) -> np.ndarray:
+    """Four-band float32 block (height, cover2, cover5, valid) for one destination block.
+
+    Every quantity is carried as a per-area density (height * valid, indicator * valid, valid), so decimating the
+    1 m source to ``decimate`` m by block mean before the reproject is exact: the destination pixel ends up with
+    sum(height * valid) / sum(valid) over the 1 m pixels it covers either way. Only the placement of the destination
+    pixel edges is quantised to the decimated grid, which at 4 m against 10 m output is below the source's own
+    positional accuracy. Several sources meeting in one block add their densities, so seams are exact too.
+    """
+    acc = np.zeros((len(BANDS), *shape), dtype=np.float64)  # densities summed over sources; band 3 is the weight
     for path in sources:
         ds = _open(path)
-        height, valid, tr = _read_source_block(ds, bounds)
+        height, valid, tr = _read_source_block(ds, bounds, decimate)
         if not valid.any():
             continue
-        h = np.where(valid, height, SENTINEL).astype(np.float32)
-        ind = [np.where(valid, (height > t).astype(np.float32), SENTINEL).astype(np.float32) for t in THRESHOLDS]
-        w = _average_onto(valid.astype(np.float32), tr, ds.crs, shape, dst_transform, nodata=None)
-        hm = _average_onto(h, tr, ds.crs, shape, dst_transform, nodata=SENTINEL)
-        cm = [_average_onto(a, tr, ds.crs, shape, dst_transform, nodata=SENTINEL) for a in ind]
-        w = np.clip(w, 0.0, 1.0)
-        ok = (w > 0) & (hm != SENTINEL)
-        acc[0][ok] += hm[ok] * w[ok]
-        for k, c in enumerate(cm):
-            acc[1 + k][ok] += c[ok] * w[ok]
-        acc[3][ok] += w[ok]
+        layers = [height * valid] + [(height > t) & valid for t in THRESHOLDS] + [valid]
+        tr_d = tr * Affine.scale(decimate)
+        for b, layer in enumerate(layers):
+            acc[b] += _average_onto(_decimate(layer, decimate), tr_d, ds.crs, shape, dst_transform)
     out = np.full((len(BANDS), *shape), np.nan, dtype=np.float32)
     wsum = acc[3]
     covered = wsum > 0
     for b in range(3):
         out[b][covered] = (acc[b][covered] / wsum[covered]).astype(np.float32)
+    out[1:3] = np.clip(out[1:3], 0.0, 1.0)
     out[3] = np.clip(wsum, 0.0, 1.0).astype(np.float32)
     return out
 
@@ -242,8 +275,8 @@ def reduce_child(tile: Tile, out_dir: Path, block: int) -> Optional[Path]:
             srcs = [p for p in cand if intersects(_SOURCES[p], bb)]
             if not srcs:
                 continue
-            data[:, r0:r0 + h, c0:c0 + w] = reduce_block(bb, (h, w), btr, srcs)
-    return _write(tile, data, out_dir, dict(n_sources=len(cand)))
+            data[:, r0:r0 + h, c0:c0 + w] = reduce_block(bb, (h, w), btr, srcs, _DECIMATE)
+    return _write(tile, data, out_dir, dict(n_sources=len(cand), decimate=_DECIMATE))
 
 
 def aggregate_parent(index: int, out_dir: Path) -> Optional[Path]:
@@ -303,6 +336,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--bbox", type=float, nargs=4, metavar=("MIN_LON", "MIN_LAT", "MAX_LON", "MAX_LAT"))
     ap.add_argument("--limit", type=int, help="process only the first N parents")
     ap.add_argument("--parents", type=int, nargs="*", help="explicit parent indices")
+    ap.add_argument("--decimate", type=int, default=DECIMATE, help="source pixels per side folded into one cell before reprojecting; 1 disables")
     a = ap.parse_args(argv)
 
     sources = index_sources(a.chm_dir)
@@ -310,16 +344,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     parents = a.parents if a.parents else parents_intersecting(sources.values(), bbox)
     if a.limit:
         parents = parents[: a.limit]
-    print(f"{len(sources)} source tiles, {len(parents)} parent tiles, {a.workers} workers -> {a.out}", flush=True)
+    print(f"{len(sources)} source tiles, {len(parents)} parent tiles, {a.workers} workers, decimate {a.decimate} -> {a.out}", flush=True)
 
     jobs = [(i, str(a.out), a.block) for i in parents]
     done = 0
     t_start = time.time()
     if a.workers <= 1:
-        _init_worker(sources)
+        _init_worker(sources, a.decimate)
         results = map(process_parent, jobs)
     else:
-        pool = mp.Pool(a.workers, initializer=_init_worker, initargs=(sources,))
+        pool = mp.Pool(a.workers, initializer=_init_worker, initargs=(sources, a.decimate))
         results = pool.imap_unordered(process_parent, jobs)
     for index, dt, written in results:
         done += 1
